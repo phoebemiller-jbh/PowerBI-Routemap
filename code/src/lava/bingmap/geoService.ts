@@ -91,21 +91,21 @@ export function initCache(locs: StringMap<ILocation>) {
     _initCache = copy(locs);
 }
 
+
 export var settings = {
-    // Maximum Bing requests at once. The Bing have limit how many request at once you can do per socket.
-    MaxBingRequest: 6,
+    // Maximum concurrent Azure Maps requests
+    MaxAzureRequest: 6,
 
-    // Maximum cache size of cached geocode data.
+    // Cache sizing
     MaxCacheSize: 3000,
-
-    // Maximum cache overflow of cached geocode data to kick the cache reducing.
     MaxCacheSizeOverflow: 1000,
-            
-    // Bing Keys and URL
-    BingKey: "Your key here",
-    BingURL: "https://dev.virtualearth.net/REST/v1/Locations?",
-    BingUrlGeodata: "https://platform.bing.com/geo/spatial/v1/public/Geodata?",
+
+    // Azure Maps credentials & URLs
+    AzureMapsKey: "b1fb1d8a-bb38-44ad-9cd9-37506a42f859",
+    AzureMapsSearchUrl: "https://atlas.microsoft.com/search/address/json",
+    AzureMapsApiVersion: "1.0",
 };
+
 
 //private
     interface IGeocodeQuery {
@@ -147,21 +147,24 @@ export var settings = {
             return this._cacheHits;
         }
 
-        public getBingUrl(): string {
-            var url = settings.BingURL + "key=" + settings.BingKey;
-            if (isNaN(+this.query)) {
-                url += "&q=" + encodeURIComponent(this.query);
-            }
-            else {
-                url += "&postalCode=" + this.query;
+        public getAzureUrl(): string {
+            const u = new URL(settings.AzureMapsSearchUrl);
+            u.searchParams.set("api-version", settings.AzureMapsApiVersion);
+            u.searchParams.set("subscription-key", settings.AzureMapsKey);
+
+            // Azure Maps uses a single 'query' parameter for addresses/postal codes
+            // Preserve your numeric-vs-freeform handling by still passing as query.
+            u.searchParams.set("query", this.query);
+
+            //Local
+            const cultureName = (navigator as any)['userLanguage'] || navigator.language;
+            if (cultureName) {
+                u.searchParams.set("language", cultureName);
             }
 
-            var cultureName = navigator['userLanguage'] || navigator["language"];
-            if (cultureName) {
-                url += "&c=" + cultureName;
-            }
-            url += "&maxRes=20";
-            return url;
+            // Results limit
+            u.searchParams.set("limit", "20");
+            return u.toString();
         }
     }
 
@@ -213,23 +216,21 @@ export var settings = {
 
     function releaseQuota(decrement: number = 0) {
         activeRequests -= decrement;
-        while (activeRequests < settings.MaxBingRequest) {
-            if (geocodeQueue.length == 0) {
-                break;
-            }
+        while (activeRequests < settings.MaxAzureRequest) {
+            if (geocodeQueue.length === 0) break;
             activeRequests++;
-            makeRequest(geocodeQueue.shift());
+            makeRequest(geocodeQueue.shift()!);
         }
     }
 
     // var debugCache: { [key: string]: ILocation };
     function makeRequest(item: IGeocodeQueueItem) {
         // Check again if we already got the coordinate;
-        var result = findInCache(item.query);
-        if (result) {
-            result.address = item.query.query;
+        const cached = findInCache(item.query);
+        if (cached) {
+            cached.address = item.query.query;
             setTimeout(() => releaseQuota(1));
-            item.then(result);
+            item.then(cached);
             return;
         }
 
@@ -257,34 +258,50 @@ export var settings = {
         // Unfortunately the Bing service doesn't support CORS, only jsonp. 
         // This issue must be raised and revised.
         // VSTS: 1396088 - Tracking: Ask: Bing geocoding to support CORS
-        var url = item.query.getBingUrl();
+        const url = item.query.getAzureUrl();
 
-        jsonp.get(url, data => {            
-            if (!data || !data.resourceSets || data.resourceSets.length < 1) {
+        fetch(url, {
+            method: "GET",
+            // You can add headers if needed - Azure accepts params; CORS is enabled.
+            // headers: { "Accept-Language": cultureName ) // optional
+        })
+        .then(res => {
+            if (!res.ok) {
+                throw new Error('Azure Maps HTTP ${res.status}');
+            }
+            return res.json();
+        })
+        .then(data => {
+            // Expected shape: { results: [ {position: { Lat, Lon }, address: { freeformAddress }, type, poi? } ] }
+            if (!data || !Array.isArray(data.results) || data.results.length < 1) {
                 completeRequest(item, ERROR_EMPTY, null);
                 return;
             }
-            var error = null as Error, result=null as ILocation;
-            try {
-                var resources = data.resourceSets[0].resources;
-                if (Array.isArray(resources) && resources.length > 0) {
-                    var index = getBestResultIndex(resources, item.query);
-                    var pointData = resources[index].point.coordinates;
-                    var result = {
-                        latitude: +pointData[0],
-                        longitude: +pointData[1],
-                        type: resources[index].entityType,
-                        name: resources[index].name
-                    } as ILocation;
-                }
-                else {
-                    error = ERROR_EMPTY;
-                }
-            }
-            catch (e) {
-                error = e;
-            }
-            completeRequest(item, error, result);
+
+            const index = getBestResultIndexAzure(data.results, item.query);
+            const best = data.results[index];
+
+            const lat = +best.position.lat;
+            const lon = +best.position.lon;
+
+            const displayName = 
+                (best.poi && best.poi.name) ||
+                (best.address && best.address.freeformAddress) ||
+                item.query.query;
+
+            const coord: ILocation = {
+                latitude: lat,
+                longitude: lon,
+                type: best.type || "Geography",
+                name: displayName,
+                address: item.query.query, // set below too for consistency
+            };
+
+            completeRequest(item, null as any, coord);
+        })
+        .catch(err => {
+            // Consider logging err for diagnostics
+            completeRequest(item, err, null);
         });
     }
 
@@ -315,20 +332,25 @@ export var settings = {
         dequeueTimeoutId = null;
     }
 
-    function captureBingErrors() {
+    function captureMapsErrors() {
         try {
-            var lastError: Function = window.window.onerror || (() => { });    
-            window.window.onerror = (msg: Object, url: string, line: number, column?: number, error?: any) => {
-                if (url.indexOf(settings.BingURL) != -1 || url.indexOf(settings.BingUrlGeodata) != -1) {
-                    return false;
-                }
-                lastError(msg, url, line, column, error);
+            const lastError: OnErrorEventHandler = window.onerror || (() => {});  
+            window.onerror = (msg: any, url: string, line: number, column?: number, error?: any) => {
+                // if you want to suppress only Azure Maps scrip errors (not typical with fetch), you could check 'atlas.microsoft.com' here. Usually unnecessary.
+                return lastError ? lastError(msg, url, line, column, error) : false;
             };
-        }
-        catch(error) {
+        } catch (error) {
             console.log(error);
         }
     }
 
+    function reset(): void {
+        geocodeCache = {};
+        geocodeQueue = [];
+        activeRequests = 0;
+        clearTimeout(dequeueTimeoutId);
+        dequeueTimeoutId = null as any;
+    }
+
     reset();
-    captureBingErrors();
+    captureMapsErrors();
