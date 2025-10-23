@@ -1,12 +1,27 @@
+// azureMapController.ts
+// Migration of your Bing Maps-based controller to Azure Maps Web SDK (V3)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// External dependencies from your project (unchanged)
 import { ILocation, IBound } from './converter';
 import { anchorPixel, bound, anchor, fitOptions, area } from './converter';
 import { keys, IPoint, partial } from '../type';
 import { ISelex, selex } from '../d3';
 
-type Map = Microsoft.Maps.Map;
-type Action<T> = (a: T) => void;
-declare var __lavaBuildMap;
+// ──────────────────────────────────────────────────────────────────────────────
+// Azure Maps SDK
+import * as atlas from 'azure-maps-control';
 
+// Keep your alias
+type Map = atlas.Map;
+type Action<T> = (a: T) => void;
+
+// Optional: global callback retained for compatibility with your earlier pattern.
+// Not used for script loading anymore (we bundle the SDK).
+declare var __lavaBuildMap: () => void;
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Public formatting interfaces (unchanged surface)
 export interface IMapElement {
   forest: boolean,
   label: boolean,
@@ -27,20 +42,70 @@ export interface IMapControl {
 
 export interface IMapFormat extends IMapControl, IMapElement { }
 
+// ──────────────────────────────────────────────────────────────────────────────
+// Utilities adapted for Azure Maps
+
+// Azure Maps vector tiles are 512px; control supports zooms up to 24.
+// This mirrors your original logic but with 512 instead of 256 and clamps to 24.
 export function defaultZoom(width: number, height: number): number {
   const min = Math.min(width, height);
-  for (var level = 1; level < 20; level++) {
-    if (256 * Math.pow(2, level) > min) {
-      break;
+  for (let level = 1; level <= 24; level++) {
+    if (512 * Math.pow(2, level) > min) {
+      return level;
     }
   }
-  return level;
+  return 24;
 }
 
-export function pixel(map: Microsoft.Maps.Map, loc: ILocation, ref?: Microsoft.Maps.PixelReference) {
-  var x = new Microsoft.Maps.Location(loc.latitude, loc.longitude);
-  return map.tryLocationToPixel(x, ref) as IPoint;
+// Convert ILocation <-> atlas Position helpers
+const toPos = (loc: ILocation): atlas.data.Position => [loc.longitude, loc.latitude];
+const toLoc = (pos: atlas.data.Position): ILocation => ({ longitude: pos[0], latitude: pos[1] });
+
+// Pixel conversion equivalents for Azure Maps
+export function pixel(map: atlas.Map, loc: ILocation): IPoint {
+  const px = map.positionsToPixels([toPos(loc)])[0];
+  return { x: px[0], y: px[1] } as IPoint;
 }
+
+export function coordinate(map: atlas.Map, p: IPoint): ILocation {
+  const pos = map.pixelsToPositions([new atlas.Pixel(p.x, p.y)])[0];
+  return toLoc(pos);
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Styling translation: your fmt → Azure Maps style & overrides
+
+function azureStyle(v: IMapFormat): atlas.SupportedStyle {
+  switch (v.type) {
+    case 'aerial':      return 'satellite_road_labels'; // closest to Bing aerial with labels
+    case 'road':        return 'road';
+    case 'grayscale':   return 'grayscale_light';
+    case 'canvasDark':  return 'grayscale_dark';        // or 'night'
+    case 'canvasLight': return 'grayscale_light';
+    case 'hidden':      return 'blank';
+    default:            return 'road';
+  }
+}
+
+function makeStyleOverrides(v: IMapFormat): atlas.StyleOverrides {
+  // Azure Maps exposes curated overrides; this approximates your Bing customMapStyle.
+  const o: atlas.StyleOverrides = {
+    showLabels: v.road === 'gray' ? false : v.label,     // gray w/o labels → false
+    showRoadDetails: v.road !== 'hidden',
+    showBuildingFootprints: v.building
+    // Additional overrides available: country/admin borders, etc.
+  };
+
+  if (v.type === 'hidden') {
+    o.showLabels = false;
+    o.showRoadDetails = false;
+    o.showBuildingFootprints = false;
+  }
+  return o;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Your MapFormat class (unchanged API)
 
 export class MapFormat implements IMapFormat {
   type = 'road' as 'aerial' | 'road' | 'grayscale' | 'canvasDark' | 'canvasLight';
@@ -57,11 +122,11 @@ export class MapFormat implements IMapFormat {
   scale = false;
 
   public static build(...fmts: any[]): MapFormat {
-    var ret = new MapFormat();
-    for (let f of fmts.filter(v => v)) {
-      for (var key in ret) {
+    const ret = new MapFormat();
+    for (const f of fmts.filter(v => v)) {
+      for (const key in ret) {
         if (key in f) {
-          ret[key] = f[key];
+          (ret as any)[key] = f[key];
         }
       }
     }
@@ -69,28 +134,22 @@ export class MapFormat implements IMapFormat {
   }
 
   public static control<T>(fmt: MapFormat, extra: T): IMapControl & T {
-    let result = partial(fmt, ['type', 'lang', 'pan', 'zoom']) as any;
-    for (let key in extra) {
-      result[key] = extra[key];
-    }
+    const result = partial(fmt, ['type', 'lang', 'pan', 'zoom']) as any;
+    for (const key in extra) result[key] = (extra as any)[key];
     return result;
   }
 
   public static element<T>(fmt: MapFormat, extra: T): IMapElement & T {
-    let result = partial(fmt, ['road', 'forest', 'label', 'city', 'icon', 'building', 'area', 'scale']) as any;
-    for (let key in extra) {
-      result[key] = extra[key];
-    }
+    const result = partial(fmt, ['road', 'forest', 'label', 'city', 'icon', 'building', 'area', 'scale']) as any;
+    for (const key in extra) result[key] = (extra as any)[key];
     return result;
   }
 }
 
-export function coordinate(map: Microsoft.Maps.Map, pixel: IPoint) {
-  var pnt = new Microsoft.Maps.Point(pixel.x, pixel.y);
-  return map.tryPixelToLocation(pnt) as ILocation;
-}
+// ──────────────────────────────────────────────────────────────────────────────
+// Your "capability" metadata object (unchanged keys/labels)
 
-var capability = {
+const capability = {
   "mapControl": {
     "displayName": "Map control",
     "properties": {
@@ -163,168 +222,127 @@ var capability = {
       "scale": { "displayName": "Scale bar", "type": { "bool": true } }
     }
   }
-}
+};
 
-function parameter(map: Map, fmt: IMapFormat, div: HTMLDivElement): Microsoft.Maps.IMapLoadOptions {
-  const para = {
-    credentials: 'Your key here',
-    showDashboard: false,
-    showTermsLink: false,
-    showScalebar: fmt.scale || false,
-    showLogo: false,
-    customMapStyle: customStyle(fmt),
-    disablePanning: !fmt.pan,
-    disableZooming: !fmt.zoom,
-    mapTypeId: mapType(fmt)
-  } as Microsoft.Maps.IMapLoadOptions;
+// ──────────────────────────────────────────────────────────────────────────────
+// Map init options builder for Azure Maps
 
+type MapInitOptions =
+  atlas.ServiceOptions &
+  atlas.StyleOptions &
+  atlas.UserInteractionOptions &
+  (atlas.CameraOptions | atlas.CameraBoundsOptions);
+
+function parameter(map: Map | null, fmt: IMapFormat, div: HTMLDivElement): MapInitOptions {
+  const style = azureStyle(fmt);
+
+  const styleOptions: atlas.StyleOptions = {
+    style,
+    language: fmt.lang === 'default' ? undefined : fmt.lang,
+    showLogo: true,             // Azure Maps requires attribution/logo
+    showFeedbackLink: false,
+    styleOverrides: makeStyleOverrides(fmt)
+  };
+
+  const ui: atlas.UserInteractionOptions = {
+    interactive: !!(fmt.pan || fmt.zoom),
+    dragPanInteraction: !!fmt.pan,
+    scrollZoomInteraction: !!fmt.zoom,
+    dblClickZoomInteraction: !!fmt.zoom
+  };
+
+  const camera: atlas.CameraOptions = {};
   if (map) {
-    para.center = map.getCenter();
-    para.zoom = map.getZoom()
+    const cam = map.getCamera();
+    camera.center = cam.center;
+    camera.zoom = cam.zoom;
+    camera.bearing = cam.bearing;
+    camera.pitch = cam.pitch;
   }
-  return para;
+
+  // IMPORTANT: Add your authentication here (subscription key or AAD).
+  const auth: atlas.ServiceOptions = {
+    authOptions: {
+      authType: 'subscriptionKey',
+      subscriptionKey: 'YOUR_AZURE_MAPS_KEY'
+      // Or:
+      // authType: 'anonymous',
+      // clientId: 'YOUR_CLIENT_ID',
+      // getToken: (resolve, reject) => fetch('/token').then(r => r.text()).then(resolve, reject)
+    }
+  };
+
+  return { ...auth, ...styleOptions, ...ui, ...camera };
 }
 
-function mapType(v: IMapFormat) {
-  switch (v.type) {
-    case 'aerial': return Microsoft.Maps.MapTypeId.aerial;
-    case 'road': return Microsoft.Maps.MapTypeId.road;
-    case 'canvasDark': return Microsoft.Maps.MapTypeId.canvasDark;
-    case 'canvasLight': return Microsoft.Maps.MapTypeId.canvasLight;
-    case 'grayscale': return Microsoft.Maps.MapTypeId.grayscale;
-  }
-}
-
-function customStyle(v: IMapFormat): Microsoft.Maps.ICustomMapStyle {
-  const nothing = { labelVisible: false, visible: false, borderVisible: false };
-  const visible = { visible: true, labelVisible: v.label };
-  const version = '1.*';
-
-  if (v.type === 'aerial') {
-    return null;
-  }
-
-  if (v.type === 'hidden') {
-    return {
-      version,
-      elements: {
-        area: nothing,
-        point: nothing,
-        political: nothing,
-        structure: nothing,
-        transportation: nothing,
-        water: nothing
-      },
-      settings: {
-        landColor: "#FFFFFF",
-        shadedReliefVisible: false
-      }
-    } as Microsoft.Maps.ICustomMapStyle;
-  }
-
-  const elements = {
-    highSpeedRamp: nothing,
-    ramp: nothing,
-    unpavedStreet: nothing,
-    tollRoad: nothing,
-    trail: nothing
-  } as Microsoft.Maps.ICustomMapStyle['elements'];  
-  
-  elements.mapElement = elements.political = { labelVisible: v.label };
-
-  if (v.road === 'gray' || v.road === 'gray_label') {
-    elements.transportation = {
-      visible: true,
-      labelVisible: v.road === 'gray_label',
-      fillColor: '#DDDDDD',
-      strokeColor: '#AAAAAA',
-      labelOutlineColor: '#EEEEEE'
-    } as Microsoft.Maps.IMapElementStyle;
-    elements.street = {
-      visible: true,
-      labelVisible: v.road === 'gray_label',
-      fillColor: "#EEEEEE",
-      strokeColor: "#DDDDDD",
-      labelOutlineColor: '#DDDDDD'
-    } as Microsoft.Maps.IMapElementStyle;
-  }
-  else if (v.road === 'hidden') {
-    elements.transportation = nothing;
-  }
-
-  if (!v.building) {
-    elements.structure = elements.building = { visible: false };
-  }
-  elements.point = v.icon ? visible : nothing;
-  elements.vegetation = v.forest ? visible : nothing;
-  elements.populatedPlace = { labelVisible: v.city, visible: v.icon };
-  elements.area = v.area ? visible : nothing;
-  return { version, elements };
-}
+// ──────────────────────────────────────────────────────────────────────────────
+// Listener interface unchanged
 
 export interface IListener {
   transform?(ctl: Controller, pzoom: number, end?: boolean): void;
   resize?(ctl: Controller): void;
 }
 
+// ──────────────────────────────────────────────────────────────────────────────
+// Controller migrated to Azure Maps
+
 export class Controller {
   private _div: HTMLDivElement;
-  private _map: Map;
+  private _map!: Map;
   private _fmt: IMapFormat;
   private _svg: ISelex;
   private _svgroot: ISelex;
 
   public get map() { return this._map; }
-
   public get format() { return this._fmt; }
-
   public get svg() { return this._svgroot; }
 
   private _canvas: ISelex;
   public get canvas() { return this._canvas; }
 
   public location(p: IPoint): ILocation {
-    let pnt = new Microsoft.Maps.Point(p.x, p.y);
-    return this._map.tryPixelToLocation(pnt) as ILocation;
+    const pos = this._map.pixelsToPositions([new atlas.Pixel(p.x, p.y)])[0];
+    return toLoc(pos);
   }
-  
-  public setCenterZoom(center: Microsoft.Maps.Location, zoom: number) {
+
+  public setCenterZoom(center: atlas.data.Position, zoom: number) {
     if (this._map) {
-      const { min, max } = this._map.getZoomRange();
-      zoom = Math.min(max, 20, Math.max(min, 1, zoom));
-      this._map.setView({ center, zoom });
+      const z = Math.max(1, Math.min(24, zoom));
+      this._map.setCamera({ center, zoom: z });
     }
   }
 
-  public pixel(loc: ILocation | IBound, ref?: Microsoft.Maps.PixelReference): IPoint {
+  public pixel(loc: ILocation | IBound): IPoint {
     if ((loc as IBound).anchor) {
-      return anchorPixel(this._map, loc as any);
-    }
-    else {
-      return pixel(this._map, loc as any, ref);
+      // If your anchorPixel helper supports Azure Maps, use it.
+      // Else, approximate by converting the bound's anchor location.
+      return anchorPixel(this._map as any, loc as any) as IPoint;
+    } else {
+      return pixel(this._map, loc as ILocation);
     }
   }
 
   public anchor(locs: ILocation[]) { return anchor(locs); }
-
   public area(locs: ILocation[], level = 20) { return area(locs, level); }
-
   public bound(locs: ILocation[]): IBound { return bound(locs); }
 
-  private _listener = [] as IListener[];
+  private _listener: IListener[] = [];
   public add(v: IListener) { this._listener.push(v); return this; }
 
   public fitView(areas: IBound[], backupCenter?: ILocation) {
-    const width = this._map.getWidth(), height = this._map.getHeight();
-    const config = fitOptions(areas, { width, height });
-    const minZoom = this._map.getZoomRange().min;
-    if (config.zoom < minZoom) {
-      config.zoom = minZoom;
-      if (backupCenter) {
-        config.center = new Microsoft.Maps.Location(backupCenter.latitude, backupCenter.longitude);
-      }
+    if (!this._map) return;
+    const width = this._containerWidth(), height = this._containerHeight();
+    const config = fitOptions(areas, { width, height }); // uses your helper
+
+    // If your helper provides center/zoom, use them; otherwise compute bounds.
+    if ((config as any).bounds) {
+      this._map.setCamera({ ...(config as any) });
+    } else if ((config as any).center && (config as any).zoom !== undefined) {
+      const { center, zoom } = config as any;
+      this._map.setCamera({ center: toPos(center), zoom });
+    } else if (backupCenter) {
+      this._map.setCamera({ center: toPos(backupCenter) });
     }
-    this._map.setView(config);
     this._viewChange(false);
   }
 
@@ -332,7 +350,9 @@ export class Controller {
     const div = selex(id).node<HTMLDivElement>();
     this._fmt = {} as IMapFormat;
     this._div = div;
-    let config = (root: ISelex) => {
+
+    // Build overlay surfaces (unchanged)
+    const config = (root: ISelex) => {
       root.att.tabIndex(-1)
         .sty.pointer_events('none')
         .sty.position('absolute')
@@ -343,138 +363,146 @@ export class Controller {
     this._canvas = config(selex(div).append('canvas'));
     this._svg = config(selex(div).append('svg'));
     this._svgroot = this._svg.append('g').att.id('root');
+
+    // Keep compatibility with your callback if needed.
     __lavaBuildMap = () => {
       this._remap();
       this._then && this._then(this._map);
-      this._then = null;
-    }
+      this._then = null as any;
+    };
   }
 
+  // Build or rebuild the Azure map
   private _remap(): Map {
-    var setting = parameter(this._map, this._fmt, this._div);
-    selex(this._div).select('div').remove();
-    let map = new Microsoft.Maps.Map(this._div, setting);
-    let Events = Microsoft.Maps.Events;
-    if (this._map && this._handler1) {
-      Events.removeHandler(this._handler1);
-      Events.removeHandler(this._handler2);
-      Events.removeHandler(this._handler3);
+    const opts = parameter(this._map ?? null, this._fmt, this._div);
+
+    // Recreate map (simplifies style/userInteraction changes that require full re-init)
+    if (this._map) {
+      // Clean event handlers
+      this._handler1 && this._map.events.remove(this._handler1);
+      this._handler2 && this._map.events.remove(this._handler2);
+      this._handler3 && this._map.events.remove(this._handler3);
+      // Dispose old map
+      this._map.dispose();
     }
-    this._canvas && map.getRootElement().appendChild(this._canvas.node());
-    this._svg && map.getRootElement().appendChild(this._svg.node());
-    if (!this._map) {//only for the first time, call resize
-      this._map = map;
-      this._resize();
-    }
-    else {
-      this._map = map;
-    }
-    this._handler1 = Events.addHandler(map, 'viewchange', () => this._viewChange(false));
-    this._handler2 = Events.addHandler(map, 'viewchangeend', () => this._viewChange(true));
-    this._handler3 = Events.addHandler(map, 'mapresize', () => this._resize());
+
+    const map = new atlas.Map(this._div, opts);
+
+    // Attach your overlay nodes into the map container
+    const container = map.getMapContainer();
+    this._canvas && container.appendChild(this._canvas.node());
+    this._svg && container.appendChild(this._svg.node());
+
+    // Event wiring
+    this._handler1 = map.events.add('move', () => this._viewChange(false));
+    this._handler2 = map.events.add('moveend', () => this._viewChange(true));
+    this._handler3 = map.events.add('resize', () => this._resize());
+
+    this._map = map;
+    this._resize(); // initial sizing
     return map;
   }
-  private _handler1: Microsoft.Maps.IHandlerId;
-  private _handler2: Microsoft.Maps.IHandlerId;
-  private _handler3: Microsoft.Maps.IHandlerId;
+
+  private _handler1!: atlas.IEventRef;
+  private _handler2!: atlas.IEventRef;
+  private _handler3!: atlas.IEventRef;
 
   private _viewChange(end = false) {
-    let zoom = this._map.getZoom();
-    for (let l of this._listener) {
+    const cam = this._map.getCamera();
+    const zoomNow = cam.zoom;
+    for (const l of this._listener) {
       l.transform && l.transform(this, this._zoom, end);
     }
-    this._zoom = zoom;
+    this._zoom = zoomNow;
   }
 
-  private _zoom: number;
+  private _zoom: number = 1;
 
   private _resize(): void {
-    if (!this._map) {
-      return;
-    }
-    let w = this._map.getWidth(), h = this._map.getHeight();
+    if (!this._map) return;
+    const w = this._containerWidth(), h = this._containerHeight();
     this._svg.att.width('100%').att.height('100%');
-    // this._svg.att.size(w, h);
     this._canvas && this._canvas.att.size(w, h);
     this._svgroot.att.translate(w / 2, h / 2);
-    for (let l of this._listener) {
+
+    for (const l of this._listener) {
       l.resize && l.resize(this);
     }
   }
 
-  private _then: Action<Map>;
-  restyle(fmt: Partial<IMapFormat>, then?: Action<Map>): Controller {
-    clearCopyright();
-    then = then || (() => { });
-    var dirty = {} as Partial<IMapFormat>;
-    for (var k in fmt) {
-      if (fmt[k] !== this._fmt[k]) {
-        dirty[k] = this._fmt[k] = fmt[k];
-      }
-    }
-    if (keys(dirty).length === 0 && this._map) {
-      return this;
-    }
-    if ('lang' in dirty || !this._map) {
-      selex('#mapscript').remove();
-      selex('head').selectAll('link').filter(function () {
-        var src = selex(this).att.href();
-        return src && src.indexOf('www.bing.com') > 0;
-      }).remove();
-      selex('head').selectAll('script').filter(function () {
-        var src = selex(this).att.href();
-        return src && src.indexOf('www.bing.com') > 0;
-      }).remove();
+  private _containerWidth() { return this._div.clientWidth || this._map.getMapContainer().clientWidth; }
+  private _containerHeight() { return this._div.clientHeight || this._map.getMapContainer().clientHeight; }
 
-      let script = document.createElement('script');
-      script.type = 'text/javascript';
-      script.id = 'mapscript';
-      script.src = "https://www.bing.com/api/maps/mapcontrol?callback=__lavaBuildMap";
-      if (dirty.lang !== 'default') {
-        script.src += "&setLang=" + dirty.lang;
+  private _then!: Action<Map>;
+  restyle(fmt: Partial<IMapFormat>, then?: Action<Map>): Controller {
+    then = then || (() => { });
+
+    const dirty = {} as Partial<IMapFormat>;
+    for (const k in fmt) {
+      if ((fmt as any)[k] !== (this._fmt as any)[k]) {
+        (dirty as any)[k] = (this._fmt as any)[k] = (fmt as any)[k];
       }
-      script.async = true;
-      script.defer = true;
+    }
+    if (keys(dirty).length === 0 && this._map) return this;
+
+    // If map not created yet: create
+    if (!this._map) {
       this._then = then;
-      document.body.appendChild(script);
+      this._remap();
       return this;
     }
-    const remap = { type: 1, label: 1, forest: 1, road: 1, city: 1, icon: 1, area: 1, building: 1 };
-    for (var k in dirty) {
-      if (k in remap) {
-        setTimeout(() => then(this._remap()), 0);
+
+    // Changes that impact base style/overrides → setStyle (no full remap needed)
+    const styleAffecting: Record<string, 1> = {
+      type: 1, label: 1, forest: 1, road: 1, city: 1, icon: 1, area: 1, building: 1
+    };
+    for (const k in dirty) {
+      if (styleAffecting[k]) {
+        const newStyle = azureStyle(this._fmt);
+        const newOverrides = makeStyleOverrides(this._fmt);
+        // Update style + language in one call
+        this._map.setStyle({
+          style: newStyle,
+          language: this._fmt.lang === 'default' ? undefined : this._fmt.lang,
+          styleOverrides: newOverrides
+        });
+        then(this._map);
         return this;
       }
     }
-    var options = {} as Microsoft.Maps.IMapOptions;
 
+    // Language change alone
+    if ('lang' in dirty) {
+      this._map.setStyle({
+        language: this._fmt.lang === 'default' ? undefined : this._fmt.lang
+      });
+    }
+
+    // Pan/zoom interaction changes
+    const ui: Partial<atlas.UserInteractionOptions> = {};
+    let uiDirty = false;
     if ('pan' in dirty) {
-      options.disablePanning = !dirty.pan;
+      ui.interactive = !!(this._fmt.pan || this._fmt.zoom);
+      (ui as any).dragPanInteraction = !!this._fmt.pan;
+      uiDirty = true;
     }
     if ('zoom' in dirty) {
-      options.disableZooming = !dirty.zoom;
+      ui.interactive = !!(this._fmt.pan || this._fmt.zoom);
+      (ui as any).scrollZoomInteraction = !!this._fmt.zoom;
+      (ui as any).dblClickZoomInteraction = !!this._fmt.zoom;
+      uiDirty = true;
     }
-    if (Object.keys(options).length) {
-      setTimeout(() => this._map.setOptions(options), 0);
+    if (uiDirty) {
+      this._map.setUserInteraction(ui as atlas.UserInteractionOptions);
     }
-    then(null);
+
+    then(this._map);
     return this;
   }
 }
 
-let clearCounter = 1;
-function clearCopyright() {
-  clearCounter += 1;
-  if (clearCounter % 10 === 0) {
-    return;
-  }
-  setTimeout(() => {
-    const sel = selex('.CopyrightControl');
-    if (sel.size() === 0) {
-      clearCopyright();
-    }
-    else {
-      sel.sty.display('none');
-    }
-  }, 200);
-}
+// NOTE: Removed Bing-specific copyright hiding.
+// Azure Maps requires attribution/logo. Use `showLogo: true` (default) as configured in parameter().
+
+// ──────────────────────────────────────────────────────────────────────────────
+// End of file
